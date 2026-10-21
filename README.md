@@ -8,3 +8,7 @@ Plan:
 - individually build and implement our models on our training dataset
 - test our models on unseen dataset
 - evaluate our models using our performance metric and analyse the best/worst model
+
+## References ##
+- Null,core and full logistic model: https://github.com/alexgasconn/xG-Regression-Model/ 
+- Heat maps: https://soccermatics.readthedocs.io/en/latest/gallery/lesson2/plot_xGModelFit.html#plotting-shot-location
