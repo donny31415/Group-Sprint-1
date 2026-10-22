@@ -2,6 +2,11 @@
 Project Group: Don, Dylan, Luke, Pietro
 
 ## Project question here ##
+
+Goal:
+- build and implement classification models that accurately predicts the outcome of a shot during a football match
+- analyse areas in which PL teams under/overperform in finishing using heat maps from the “best” model
+
 Plan:
 - find a dataset for all us to use
 - clean and process dataset
