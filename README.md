@@ -4,7 +4,7 @@ Project Group: Don, Dylan, Luke, Pietro
 ## Project question here ##
 Plan:
 - find a dataset for all us to use
-- clean and processes dataset
+- clean and process dataset
 - split dataset into training, validation and testing
 - implement your assigned model on the data, starting from a simple version then progressively adding more features
 - validate each version of your model and chose the best version to compare with rest of group
