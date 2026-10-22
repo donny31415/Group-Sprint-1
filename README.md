@@ -4,10 +4,13 @@ Project Group: Don, Dylan, Luke, Pietro
 ## Project question here ##
 Plan:
 - find a dataset for all us to use
-- decide on performance metric to use on all 4 of our models (log-loss?)
-- individually build and implement our models on our training dataset
-- test our models on unseen dataset
-- evaluate our models using our performance metric and analyse the best/worst model
+- clean and processes dataset
+- split dataset into training, validation and testing
+- implement your assigned model on the data, starting from a simple version then progressively adding more features
+- validate each version of your model and chose the best version to compare with rest of group
+- collectively test all of our models on the same testing set
+- evaluate our models’ performance using proper scoring. i.e. Brier, log-loss & ROC
+- choose the best model out of the 4 and create xG heat maps for each PL football team for one whole season
 
 ## References ##
 
