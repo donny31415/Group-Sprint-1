@@ -1,0 +1,581 @@
+---
+title: "xG model: single-hidden-layer neural network"
+output: html_document
+bibliography: bibliography.bib
+csl: https://www.zotero.org/styles/ieee
+link-citations: true
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 0. Preparation
+
+The **tidyverse** package provides a collection of tools for working with and visualising data. In this analysis, we use functions such as `read_csv()`, `dplyr` functions for data manipulation, and `ggplot2` for creating plots.
+
+The **nnet** package allows us to fit the neural network model used later in this analysis.
+
+We use `set.seed(2026)` to fix R's random-number generator. This makes operations that depend on random numbers, such as the initialisation of the neural network, reproducible so that we obtain the same results when the analysis is rerun.
+
+Install the required packages once using:
+
+`install.packages(c("tidyverse", "nnet"))`
+
+The CSV file should be available at the location specified by `data_path`. If the file is stored elsewhere, update `data_path` accordingly.
+
+```{r setup}
+library(tidyverse)
+library(nnet)
+
+# Set the random seed so that results are reproducible
+set.seed(2026)
+
+# Location of the cleaned shot data
+data_path <- "~/University/Documents/4th Year/Data Science Toolbox/Sprint 1/Data/Cleaned Shot Data.csv"
+
+# Check that data_path is a single character string
+cat("Working directory:", getwd(), "\n")
+cat("Class of data_path:", class(data_path), "\n")
+
+if (!is.character(data_path) || length(data_path) != 1) {
+  stop(
+    'data_path must be a single text string, e.g. "C:/Users/me/project/shots.csv"'
+  )
+}
+
+# Check that the CSV file exists before attempting to read it
+if (!file.exists(data_path)) {
+  stop(
+    "Cannot find the CSV at: ", data_path,
+    "\nFiles in working directory: ",
+    paste(list.files(), collapse = ", ")
+  )
+}
+```
+
+## 1. Data and features
+
+The `read_csv()` function loads the 50,798 shots in the dataset. Each shot is identified using `row_id`, which corresponds to the row number in the original CSV file. This allows predictions produced in R and Python to be matched exactly.
+
+The `xg` column contains Understat's own expected goals (xG) estimate. It is therefore **never used as an input feature** for the neural network and is instead retained only as a benchmark against which the model's predictions can be compared.
+
+We then create a new column, `distance`, which calculates the distance from the goal using Pythagoras' theorem, assuming the centre of the goal is located at $x = 120,\ y = 40$.
+
+We then separate the columns according to their roles:
+
+- **Target:** `result` — the outcome of the shot, where 1 represents a goal and 0 represents no goal.
+- **Excluded:** `xg` is used only as a benchmark. `team` and `season` are excluded because they are not relevant to the prediction, while `row_id` is an identifier rather than a predictive feature.
+- **Features:** The remaining 35 columns are used as the network's 35 input variables.
+- **Continuous variables:** `x`, `y`, `angle_to_goal`, `distance`, `minute`, and the score-related variables are rescaled before being supplied to the neural network, since neural networks train more effectively using numerical netowkrs on similar scales.
+
+```{r data}
+shots <- read_csv(data_path, show_col_types = FALSE) %>%
+  mutate(row_id = row_number(),
+         distance = sqrt((120 - x)^2 + (40 - y)^2))  # goal at x = 120, y = 40
+
+drop_cols <- c("xg", "result", "team", "season", "row_id")
+feature_cols <- setdiff(names(shots), drop_cols)
+continuous_cols <- c("x", "y", "angle_to_goal", "distance", "minute",
+                     "team_goals_before", "opp_goals_before", "score_diff")
+
+cat("Shots:", nrow(shots), " Goal rate:", round(mean(shots$result), 4), "\n")
+cat("Features used:", length(feature_cols), "\n")
+```
+
+## 2. Train / validation / test split (by season)
+
+The data is split by season rather than randomly. Seasons 2021/22–2023/24 are used for training (29,813 shots), 2024/25 is used for validation (9,844 shots), and 2025/26 together with the partial 2026/27 season are used for testing (11,141 shots).
+
+Splitting the data chronologically helps prevent **data leakage** and better reflects how the model would be used in practice. The model is trained using historical shots, tuned using a subsequent season, and finally evaluated on future seasons that were not available during model development. This also ensures that entire seasons are kept within a single dataset.
+
+The `scale_fit` function calculates and stores the mean and standard deviation of each continuous input using **the training data only**. These training-set values are then used to standardise the continuous variables in the training, validation, and test sets. Using only the training data to calculate these values prevents information from the validation or test sets from influencing the model-development process.
+
+The `to_matrix` function applies this standardisation by subtracting the training mean from each value and dividing by the training standard deviation. The standardisation is calculated as:
+
+$$
+z = \frac{x-\mu_{\text{train}}}{\sigma_{\text{train}}}
+$$
+
+where $x$ is the original value, $\mu_{\text{train}}$ is the mean of that variable calculated from the training data, and $\sigma_{\text{train}}$ is its standard deviation calculated from the training data. This is done for each feature and transforms the continuous variables to a comparable scale, with values centered around zero.
+
+The function then converts the resulting features into a numeric matrix, which is the format required by `nnet`.
+
+```{r split}
+train_seasons <- c("2021/22", "2022/23", "2023/24")
+val_seasons   <- c("2024/25")
+test_seasons  <- c("2025/26", "2026/27")  # 2026/27 is a partial season
+
+train <- filter(shots, season %in% train_seasons)
+val   <- filter(shots, season %in% val_seasons)
+test  <- filter(shots, season %in% test_seasons)
+
+c(train = nrow(train), val = nrow(val), test = nrow(test))
+```
+
+Continuous inputs are standardised using the mean and standard deviation calculated from the **training data only**. This is important for neural networks because inputs measured on very different scales can make optimisation less efficient. Standardising continuous input variables helps place predictors on comparable scales when fitting neural networks, as seen in Chapter 10.9.2 in [@james2021islr].
+
+
+```{r scaling}
+scale_fit <- function(df) {
+  list(
+    center = sapply(df[continuous_cols], mean),
+    scale  = sapply(df[continuous_cols], sd)
+  )
+}
+
+to_matrix <- function(df, sc) {
+  X <- as.data.frame(df[feature_cols])
+  
+  Z <- sweep(
+    as.matrix(df[continuous_cols]),
+    2,
+    sc$center,
+    "-"
+  )
+  
+  X[continuous_cols] <- sweep(
+    Z,
+    2,
+    sc$scale,
+    "/"
+  )
+  
+  as.matrix(X)
+}
+```
+
+## 3. Neural Network Model
+
+A neural network was used to predict the probability that a shot would result in a goal. The model takes the 35 selected feature variables as inputs and uses one hidden layer to learn patterns in the data. The number of neurons in this hidden layer is controlled by the `size` parameter.
+
+### Step 1: Define the model inputs
+
+For each shot, the model receives 35 input features describing the shot and its context. These include variables such as shot location, distance to goal, angle to goal, match minute, and score-related information.
+
+The feature columns and target variable are selected in R as follows:
+
+```{r}
+target_col <- "result"
+
+exclude_cols <- c(
+  "xg",
+  "team",
+  "season",
+  "row_id",
+  target_col
+)
+
+feature_cols <- setdiff(names(shots), exclude_cols)
+
+X_train <- to_matrix(train, scale_fit(train))
+y_train <- train[[target_col]]
+```
+
+The `feature_cols` vector identifies the input variables, while `y_train` contains the actual outcomes used during training. The `to_matrix()` function prepares the input data in matrix form for the neural network.
+
+### Step 2: Calculate the hidden-layer activations
+
+Each neuron in the hidden layer receives all 35 input features. Each feature is multiplied by a learned weight, the weighted values are summed, and a bias is added. This is similar to that seen in Chapter 10.1 of [@james2021islr] and the result is passed through a sigmoid activation function:
+
+$$
+h_j=\sigma\left(\sum_{i=1}^{35}w_{ji}x_i+b_j\right)
+$$
+
+where $x_i$ represents an input feature, $w_{ji}$ is the weight connecting input $i$ to hidden neuron $j$, and $b_j$ is the neuron's bias. The sigmoid function is:
+
+$$
+\sigma(z)=\frac{1}{1+e^{-z}}
+$$
+
+It converts the weighted sum into an activation between 0 and 1. Each hidden neuron has its own weights and bias, allowing it to learn a different combination of the input features. For example, a neuron might learn a pattern involving shot distance and angle to goal, although individual neurons are not necessarily directly interpretable.
+
+The hidden layer is specified through the `size` argument when fitting the model. For example, `size = 5` creates five neurons in a single hidden layer.
+
+### Step 3: Calculate the predicted probability
+
+This section is also inspired by Cpater 10.2 of [@james2021islr]. The activations produced by the hidden layer are passed to an output neuron. This neuron combines the hidden-layer activations using a second set of learned weights and a bias, then applies the sigmoid function to produce the predicted probability of a goal:
+
+$$
+\hat{p}=\sigma\left(\sum_{j=1}^{H}v_jh_j+b_o\right)
+$$
+
+where $H$ is the number of hidden neurons, $h_j$ is the activation of hidden neuron $j$, $v_j$ is the weight connecting that neuron to the output, and $b_o$ is the output bias. The sigmoid function ensures that the predicted probability lies between 0 and 1.
+
+The network is fitted using the `nnet` package through the `fit_nn()` function. The `size` parameter specifies the number of neurons in the hidden layer, `decay` controls weight decay to help reduce overfitting, and `maxit` sets the maximum number of optimisation iterations. The `entropy = TRUE` argument specifies the entropy-based error function for binary prediction, `MaxNWts` sets the maximum permitted number of weights, and `trace = FALSE` suppresses training progress output.
+
+The model returns a probability rather than directly classifying a shot as a goal or a non-goal. For example, a predicted probability of 0.20 indicates that the model estimates a 20% chance of the shot resulting in a goal.
+
+To reduce dependence on a single random initialisation, three networks are fitted using different random seeds. Each network produces its own predicted probability, and these probabilities are averaged to obtain the final prediction:
+
+$$
+\hat{p}_{\mathrm{ensemble}}=\frac{1}{3}\sum_{k=1}^{3}\hat{p}_k
+$$
+
+where $\hat{p}_k$ is the predicted probability from network $k$. This averaging can reduce variation between individual model fits.
+
+### Step 4: Measure the prediction error
+
+During training, the predicted probability is compared with the actual outcome. The model uses binary cross-entropy, also known as log loss, to measure prediction error:
+
+$$
+L=-\left[y\log(\hat{p})+(1-y)\log(1-\hat{p})\right]
+$$
+
+Here, $y$ is the actual outcome and $\hat{p}$ is the predicted probability. Predictions that assign a high probability to the correct outcome receive a lower loss, while confident but incorrect predictions receive a higher loss.
+
+For example, if a shot resulted in a goal ($y=1$) but the model predicted a probability of 0.20, the loss would be $-\log(0.20)$, approximately 1.61. The model aims to minimise the loss across the training data.
+
+In the R implementation, `entropy = TRUE` tells `nnet` to use the entropy-based error function appropriate for binary outcomes.
+
+### Step 5: Update the weights and biases
+
+The network learns by adjusting its weights and biases to reduce the loss.
+
+First, backpropagation as seen in Chapter 10.7.1 in [@james2021islr] applies the chain rule to calculate how the loss changes with respect to each weight and bias. This determines how each parameter contributes to the prediction error.
+
+The optimiser then uses this information to update the parameters. In this implementation, `nnet` uses a quasi-Newton optimisation method based on Broyden–Fletcher–Goldfarb–Shanno (BFGS), rather than simple gradient descent.
+
+This process is repeated until the optimiser converges or reaches the maximum number of iterations specified by `maxit`. The weights and biases are learned from the training data; they are not manually specified.
+
+### Step 6: Apply regularisation
+
+The `decay` parameter controls weight decay, which penalises large weights and helps reduce overfitting. This encourages the network to learn patterns that generalise to unseen shots rather than relying too heavily on particular patterns in the training data.
+
+For example, a model fitted with a weight-decay value of `0.01` applies regularisation during optimisation. Different values can be compared using the validation set to assess which setting gives better predictive performance.
+
+The `MaxNWts` parameter sets an upper limit on the number of weights the model can use. It acts as a safeguard if the selected network architecture requires a large number of parameters.
+
+### Step 7: Train multiple networks and average their predictions
+
+To reduce dependence on a single random initialisation, three networks are trained using different random seeds. Each network starts with its own random initial weights and independently learns its parameters from the training data.
+
+The following functions implement this process:
+
+```{r}
+fit_nn <- function(X, y, size, decay, seeds = 1:3, maxit = 300) {
+  lapply(seeds, function(s) {
+    set.seed(s)
+
+    nnet(
+      x = X,
+      y = y,
+      size = size,
+      decay = decay,
+      maxit = maxit,
+      entropy = TRUE,
+      MaxNWts = 1e5,
+      trace = FALSE
+    )
+  })
+}
+
+predict_nn <- function(models, X) {
+  P <- do.call(
+    cbind,
+    lapply(models, function(m) {
+      as.numeric(predict(m, X, type = "raw"))
+    })
+  )
+
+  rowMeans(P)
+}
+```
+
+The `fit_nn()` function fits one network for each seed and returns a list of trained models. Setting the seed makes each initialisation reproducible. The `predict_nn()` function obtains a predicted probability from each network and calculates the average probability for every shot.
+
+The ensemble prediction is:
+
+$$
+\hat{p}_{\mathrm{ensemble}}=\frac{1}{3}\sum_{k=1}^{3}\hat{p}_k
+$$
+
+Averaging predictions from independently initialised networks can reduce variation between individual fits, although it does not guarantee improved performance.
+
+### Step 8: Select and evaluate the model
+
+The data is divided chronologically into training, validation, and test sets:
+
+```{r}
+train_seasons <- c("2021/22", "2022/23", "2023/24")
+val_seasons   <- c("2024/25")
+test_seasons  <- c("2025/26", "2026/27")
+
+train <- filter(shots, season %in% train_seasons)
+val   <- filter(shots, season %in% val_seasons)
+test  <- filter(shots, season %in% test_seasons)
+```
+
+The training set contains 29,813 shots and is used to estimate the network's weights and biases. The validation set contains 9,844 shots and is used to compare model configurations, including the number of hidden neurons (`size`) and the weight-decay setting (`decay`). The test set contains 11,141 shots and is reserved for final evaluation.
+
+This chronological split evaluates the model on later seasons than those used for training, providing a more realistic assessment of how it may perform on future shots.
+
+Overall, the neural network learns by repeatedly producing predictions, measuring their error, calculating how its parameters contribute to that error, and updating those parameters. The combination of nonlinear hidden-layer activations, regularisation, and averaging predictions from multiple networks allows the model to learn relationships between shot characteristics and the probability of scoring this is clearly spoken about in Chapter 10.7.4 of [@james2021islr].
+
+## 4. Performance metrics
+
+Several performance metrics are used to evaluate the xG model because each assesses a different aspect of predictive performance. Accuracy alone is insufficient because goals represent only approximately 11% of shots in the dataset; consequently, a model that predicts no goals could still achieve high accuracy while providing little useful information about scoring probabilities. 
+
+**Log loss** is used to assess the quality of the predicted probabilities, penalising predictions that assign low probability to outcomes that actually occur. This is appropriate for an xG model because it evaluates the probabilities themselves rather than only whether shots are classified correctly. The logarithmic scoring rule is discussed by Gneiting and Raftery (2007), who explain the theoretical properties of scoring rules for probabilistic forecasts [@gneiting2007strictly]. 
+
+**The Brier score** provides a complementary measure by calculating the mean squared difference between predicted probabilities and observed binary outcomes. It therefore quantifies the overall error in the model's probability estimates and originates from Brier's (1950) work on evaluating probabilistic forecasts [@brier1950verification]. 
+
+
+**ROC-AUC** is included to assess the model's ability to distinguish between goals and non-goals across classification thresholds. It measures discriminatory ability without requiring a single probability threshold to be selected, although a high ROC-AUC does not necessarily indicate that predicted probabilities are well calibrated [@fawcett2006roc]. 
+
+Finally, **calibration plots** compare predicted scoring probabilities with the observed frequency of goals. For example, shots assigned an xG value of 0.20 should result in goals approximately 20% of the time if the model is well calibrated. Calibration is important because xG values are intended to represent meaningful scoring probabilities, not simply to rank shots by their likelihood of resulting in a goal [@vancalster2019calibration]. Together, these metrics evaluate probability error, discrimination and calibration, providing a more comprehensive assessment of the model's suitability for estimating expected goals.
+
+The following functions calculate these metrics and prepare the data required for the calibration plots.
+
+```{r metrics}
+log_loss <- function(y, p, eps = 1e-15) {
+  p <- pmin(pmax(p, eps), 1 - eps)
+  -mean(y * log(p) + (1 - y) * log(1 - p))
+}
+brier <- function(y, p) mean((y - p)^2)
+auc <- function(y, p) {
+  r <- rank(p); n1 <- sum(y == 1); n0 <- sum(y == 0)
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+evaluate <- function(y, p, name) {
+  tibble(model = name, log_loss = log_loss(y, p), brier = brier(y, p), auc = auc(y, p))
+}
+calib_df <- function(y, p, name, bins = 10) {
+  tibble(y = y, p = p) %>%
+    mutate(bin = ntile(p, bins)) %>%
+    group_by(bin) %>%
+    summarise(mean_pred = mean(p), obs_rate = mean(y), .groups = "drop") %>%
+    mutate(model = name)
+}
+```
+
+## 5. Hyperparameter tuning on the validation season
+
+Hyperparameter tuning is used to identify the model configuration that achieves the best predictive performance on unseen data. Two hyperparameters that are investigated in this model: the number of neurons in the hidden layer (`size`) and the weight-decay parameter (`decay`).
+
+The `expand.grid()` function creates every combination of the selected hyperparameter values. Each combination is used to train a neural network on the training seasons (2021/22–2023/24), and its performance is evaluated using log loss on the validation season (2024/25). Two random initialisations are used for each configuration to reduce dependence on a single initialisation.
+
+The continuous input features are standardised using means and standard deviations calculated from the training data. These same scaling values are then applied to the validation data, preventing information from the validation season from influencing the preprocessing.
+
+The validation log loss for each configuration is recorded and displayed in a heatmap. Lower log loss indicates better predicted probabilities, with greater penalties for confident incorrect predictions. The configuration with the lowest validation log loss is selected using `which.min()`.
+
+This tuning process illustrates the bias–variance trade-off. Increasing the number of hidden neurons gives the network greater flexibility to learn complex patterns, but may also increase the risk of overfitting. Increasing weight decay penalises larger weights, which can reduce overfitting but may also restrict the network's ability to learn useful patterns. The validation data helps identify a balance between these effects.
+
+In the initial search, the best configuration was reported as `size = 2` and `decay = 0.1`. Since this result lies at the lower boundary of the hidden-unit grid, it may be worth investigating smaller networks or alternative values of weight decay. However, this result only identifies the best configuration among the combinations tested; it does not establish that it is the best possible configuration. The test set remains reserved for the final evaluation after model selection.
+
+```{r tuning}
+sc_tr <- scale_fit(train)
+X_tr  <- to_matrix(train, sc_tr)
+X_val <- to_matrix(val, sc_tr)
+
+grid <- expand.grid(size = c(2, 3, 5, 10), decay = c(0.01, 0.1, 0.3, 1))
+grid$val_logloss <- NA_real_
+
+for (i in seq_len(nrow(grid))) {
+  m <- fit_nn(X_tr, train$result, grid$size[i], grid$decay[i], seeds = 1:2, maxit = 200)
+  grid$val_logloss[i] <- log_loss(val$result, predict_nn(m, X_val))
+}
+
+ggplot(grid, aes(factor(size), factor(decay), fill = val_logloss)) +
+  geom_tile() + geom_text(aes(label = round(val_logloss, 4)), colour = "white") +
+  labs(x = "Hidden units", y = "Weight decay", fill = "Val log loss",
+       title = "Sensitivity of validation log loss to hyperparameters")
+
+best <- grid[which.min(grid$val_logloss), ]
+best
+```
+
+## 6. Final model and test-set evaluation
+
+After selecting the hyperparameters using validation log loss, the training and validation sets are combined to provide more data for fitting the final model. The scaler is refitted on this combined dataset, and the resulting scaling parameters are applied unchanged to the test set. The neural network is then trained using the selected hyperparameters and five different random seeds. Averaging the predicted probabilities from these five networks produces the final predictions, `p_nn`.
+
+The test set has not been used for hyperparameter selection or model fitting, so it provides an independent evaluation of performance on later seasons. The results table compares the neural network against Understat's xG estimates, which serve as an existing benchmark, and a constant base-rate model that assigns every shot the same probability: the goal rate in the combined training and validation data.
+
+Performance is assessed using log loss, Brier score and ROC-AUC. Log loss and Brier score evaluate the quality of the predicted probabilities, while ROC-AUC measures how well the model ranks goal-scoring shots above shots that do not result in goals. The calibration plot provides a further comparison between predicted probabilities and observed goal rates.
+
+```{r}
+# Combine training and validation data
+trval <- bind_rows(train, val)
+
+# Fit the scaler on the combined data and transform the inputs
+sc_fin <- scale_fit(trval)
+X_fin  <- to_matrix(trval, sc_fin)
+X_te   <- to_matrix(test, sc_fin)
+
+# Fit five networks using the selected hyperparameters
+final_models <- fit_nn(
+  X_fin, trval$result,
+  best$size, best$decay,
+  seeds = 1:5, maxit = 300
+)
+
+# Average the predicted probabilities
+p_nn <- predict_nn(final_models, X_te)
+
+# Compare performance on the test set
+results <- bind_rows(
+  evaluate(test$result, p_nn, "Neural network (R)"),
+  evaluate(test$result, test$xg, "Understat xG (benchmark)"),
+  evaluate(
+    test$result,
+    rep(mean(trval$result), nrow(test)),
+    "Constant base rate"
+  )
+)
+
+results
+
+# Compare calibration on the test set
+bind_rows(
+  calib_df(test$result, p_nn, "Neural network (R)"),
+  calib_df(test$result, test$xg, "Understat xG")
+) %>%
+  ggplot(aes(mean_pred, obs_rate, colour = model)) +
+  geom_abline(linetype = "dashed") +
+  geom_point() +
+  geom_line() +
+  labs(
+    x = "Mean predicted probability",
+    y = "Observed goal rate",
+    title = "Calibration on test seasons"
+  )
+```
+
+### Exporting predictions for the group comparison
+
+Each person exports the `row_id` and predicted probability for every shot in the agreed test set. The shared comparison script can then match predictions to the correct shots and calculate the evaluation metrics consistently across all models.
+
+```{r}
+write_csv(
+  tibble(row_id = test$row_id, prob = p_nn),
+  "predictions_NN_R.csv"
+)
+```
+
+### Examining the model's xG predictions
+
+The predictions are combined with shot information, including the team, season, match minute and shot location. The ten shots with the highest predicted xG and a random sample of ten shots are inspected to illustrate the model's predictions.
+
+Finally, predicted xG is summed across each team's shots and compared with actual goals and Understat's summed xG. These totals provide a team-level summary of the model's estimates of scoring opportunities. They represent expected goals rather than guaranteed numbers of goals, and differences between expected and actual goals can arise from normal variation in finishing outcomes.
+
+```{r}
+# Combine predictions with shot information
+xg_out <- test %>%
+  transmute(
+    row_id, team, season, minute, x, y,
+    goal = result,
+    nn_xg = p_nn,
+    understat_xg = xg
+  )
+
+# Display the ten shots with the highest predicted xG
+xg_out %>%
+  arrange(desc(nn_xg)) %>%
+  head(10)
+
+# Display a random sample of ten shots
+xg_out %>%
+  slice_sample(n = 10)
+
+# Compare expected goals with actual goals by team
+xg_out %>%
+  group_by(team) %>%
+  summarise(
+    shots = n(),
+    goals = sum(goal),
+    nn_xg_total = sum(nn_xg),
+    understat_xg_total = sum(understat_xg),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(nn_xg_total))
+```
+
+## 7. Exploration for the performance-metric part of the brief
+
+### 7a. Generalising to unseen shot types
+
+Train only on open-play shots, then test on set-piece shots the network has never seen, versus a network trained on everything. This shows in what sense the metric on the standard test set overstates real-world generalisability.
+
+```{r unseen-type}
+op_train <- filter(trval, is_open_play == 1)
+sp_test  <- filter(test, is_set_piece == 1)
+
+sc_op <- scale_fit(op_train)
+m_op  <- fit_nn(to_matrix(op_train, sc_op), op_train$result, best$size, best$decay)
+p_op  <- predict_nn(m_op, to_matrix(sp_test, sc_op))
+
+p_all <- predict_nn(final_models, to_matrix(sp_test, sc_fin))
+
+bind_rows(evaluate(sp_test$result, p_op,  "Trained on open play only"),
+          evaluate(sp_test$result, p_all, "Trained on all shots"),
+          evaluate(sp_test$result, sp_test$xg, "Understat xG"))
+```
+
+### 7b. Permutation importance
+
+Shuffle one feature at a time in the test set and record how much log loss increases.
+
+```{r perm-imp}
+base_ll <- log_loss(test$result, p_nn)
+perm_imp <- sapply(feature_cols, function(f) {
+  Xp <- X_te
+  Xp[, f] <- sample(Xp[, f])
+  log_loss(test$result, predict_nn(final_models, Xp)) - base_ll
+})
+perm_imp %>% sort(decreasing = TRUE) %>% head(15) %>%
+  enframe(name = "feature", value = "log_loss_increase") %>%
+  ggplot(aes(reorder(feature, log_loss_increase), log_loss_increase)) +
+  geom_col() + coord_flip() + labs(x = NULL, title = "Permutation importance (top 15)")
+```
+
+## 8. Conditions for a neural network to work
+
+Neural networks can learn complex, non-linear relationships without requiring the same specific functional form as traditional linear regression. However, they still have practical requirements and limitations.
+
+- **Sufficient training data.** The model needs enough observations to estimate its weights reliably. With 35 input features and one hidden layer containing $H$ neurons, the network has $37H+1$ weights and biases. For example, a network with two hidden neurons has 75 parameters. The training set contains approximately 30,000 shots, providing substantially more observations than model parameters, although this alone does not guarantee good generalisation.
+
+- **Suitable input data.** The inputs must be represented numerically, and missing values must be handled appropriately. In this model, categorical variables are represented using dummy variables, while continuous features are standardised using means and standard deviations calculated from the training data. Applying the same scaling parameters to validation and test data prevents information from those datasets leaking into preprocessing.
+
+- **A suitable loss function.** The model uses binary cross-entropy, also known as log loss, which measures the difference between predicted goal probabilities and observed outcomes. It is differentiable with respect to the network's weights and biases, allowing an optimisation algorithm to update the parameters during training.
+
+- **Informative features and stable relationships.** The network can only learn patterns represented in its input features. It also relies on relationships learned from earlier seasons remaining sufficiently relevant in later seasons. Changes in playing styles, tactics or the composition of the data can reduce predictive performance. The open-play experiment illustrates how restricting the data or changing the modelling conditions can affect the results.
+
+- **Appropriate treatment of dependence.** Shots from the same match or team may be correlated, so observations are not necessarily independent. Splitting data chronologically by season helps evaluate performance on later seasons, but it does not remove dependence between shots within each dataset. This should be considered when interpreting evaluation results.
+
+- **Hyperparameter tuning and random initialisation.** Neural network training involves a non-convex optimisation problem, meaning different initial weights can lead to different fitted models. The choice of hidden-layer size, weight decay and other settings can also affect performance. Testing hyperparameters on validation data and averaging predictions from networks trained with different random seeds can help assess and reduce sensitivity to individual fits.
+
+**Theoretical foundation.** The universal approximation theorem states, under suitable conditions, that a feed-forward neural network with a single hidden layer and a sufficiently large number of hidden units can approximate a broad class of continuous functions to arbitrary accuracy on a compact domain. This establishes the flexibility of the model, but it does not guarantee that training will find the best approximation or that the fitted network will generalise well to unseen shots.
+
+## 9. Pros and cons of the neural network
+
+### Advantages
+
+- **Non-linear relationships and interactions:** The network can learn complex relationships between features, such as how shot location, angle and shot type combine to influence scoring probability, without requiring these relationships to be specified manually.
+- **Smooth probability predictions:** The sigmoid activation function produces probabilities between zero and one. This is suitable for xG, where scoring probability varies with the characteristics of a shot.
+- **Direct probability optimisation:** Training with binary cross-entropy encourages accurate probability estimates, although good calibration is not guaranteed and must be evaluated separately.
+- **Regularisation:** Weight decay penalises large weights and can help reduce overfitting.
+- **Clear mathematical structure:** The network's input layer, hidden layer, output layer and training process provide a framework for explaining how the model learns and makes predictions.
+
+### Disadvantages
+
+- **Limited interpretability:** The learned weights are difficult to translate into simple statements about how individual features affect scoring probability.
+- **Sensitivity to preprocessing and settings:** Scaling, initial weights, hidden-layer size and weight decay can influence the fitted model and its performance.
+- **Non-convex optimisation:** Training does not guarantee that the globally optimal solution will be found.
+- **Performance on tabular data:** Neural networks do not necessarily outperform tree-based methods, such as gradient-boosted trees, on structured datasets. Their performance must be established through empirical comparison.
+- **Computational cost and model restrictions:** Training several networks and tuning hyperparameters adds computational overhead. The `nnet` implementation used here supports a single hidden layer, limiting the architectures that can be explored.
+
+## 10. Potential extensions
+
+Several experiments could extend this analysis and provide further insight into the model's strengths and limitations.
+
+1.  **Include team information.** Encode team identity as a categorical feature and evaluate whether it improves test-set performance. Compare the results carefully to determine whether team information captures useful differences or encourages overfitting to particular teams.
+
+2.  **Evaluate performance by shot type.** Compare log loss, Brier score, ROC-AUC and calibration for open-play shots, set pieces, penalties and headers. This would show whether the model performs consistently across different types of scoring opportunities.
+
+3.  **Investigate training-set size.** Train the model on progressively larger subsets of the training data and plot performance against the number of shots. A learning curve would help establish whether additional data is likely to improve predictions.
+
+4.  **Examine calibration across probability ranges.** Evaluate calibration separately for low-xG and high-xG shots to determine whether the model systematically overestimates or underestimates scoring probabilities in particular ranges.
+
+5.  **Compare against alternative models.** Evaluate the neural network against a logistic regression model and a tree-based model using the same chronological data split and evaluation metrics. This would establish whether the added complexity of the neural network provides a meaningful improvement.
+
+# References
