@@ -1,7 +1,7 @@
 # Group-Sprint-1
 Project Group: Don, Dylan, Luke, Pietro
 
-## Using the best performing xG model, which teams finish above or below expectation, and in which areas of the pitch? ##
+## By exploring different xG models, how can we assess where on the pitch teams are under/over performing? ##
 
 Goal:
 - build and implement classification models that accurately predicts the outcome of a shot during a football match
