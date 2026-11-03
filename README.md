@@ -63,7 +63,7 @@ The R neural network model uses:
 - readr
 - knitr
 
-## Who did what
+## Individual Contributions
 
 - **Don**: data cleaning and processing, logistic regression model
 - **Dylan**: neural network model in R, explored suitability of datasets and imported them.
