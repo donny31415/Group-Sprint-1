@@ -1,0 +1,395 @@
+---
+title: "Understat Shot Data - Recent Seasons"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+This notebook downloads shot-level data for the Premier League from Understat, adds extra features, and saves the result as a CSV file for the xG models. Understat was chosen over StatsBomb because it contains many more shots (just under 50,000, compared with about 10,000), which gives the models more observations to learn from.
+
+The notebook follows its sections: install the package, load the libraries, choose settings, define two helper functions, download the data (with caching), clean it and add features, check it with summaries and plots, and save it. The summaries and plots in Sections 7 and 8 are not part of the models. They check that the data looks sensible, for example that xG falls as distance increases and that goal and xG totals are plausible, before the data is used.
+
+## 1. Install packages (run once, manually)
+
+Install `worldfootballR` from GitHub, because the CRAN version is outdated.
+
+`devtools` allows R to install packages directly from GitHub. `worldfootballR` is the package that retrieves the Understat data, and the GitHub version is used because the CRAN version is outdated. `dplyr` and `tidyr` are used for data manipulation and `ggplot2` for plotting. The chunk has `eval=FALSE`, so it is only run by hand once and the packages are not reinstalled every time the document is knitted.
+
+```{r install, eval=FALSE}
+install.packages(c("devtools", "dplyr", "tidyr", "ggplot2"))
+devtools::install_github("JaseZiv/worldfootballR")
+```
+
+## 2. Load libraries
+
+The packages are loaded so they can be used in the rest of the notebook: `worldfootballR` downloads the data, `dplyr` and `tidyr` reshape and summarise it, and `ggplot2` draws the plots.
+
+```{r libraries}
+library(worldfootballR)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+## 3. Settings
+
+Understat league names: `"EPL"`, `"La liga"`, `"Bundesliga"`, `"Serie A"`,
+`"Ligue 1"`, `"RFPL"`.
+
+Seasons are given by their **start year**: `2021` = 2021/22, `2025` = 2025/26,
+`2026` = 2026/27. A season that doesn't exist yet, or fails to download, is
+skipped and reported rather than stopping the run.
+
+All choices are collected in one place so the notebook can be rerun for a different league or period without editing the code below. `refresh` controls whether saved data is reused, and `pause_seconds` adds a short delay between requests so the Understat website is not overloaded. If a season is still in progress, it only contains the matches played so far.
+
+```{r settings}
+leagues            <- c("EPL")                 # add more, e.g. c("EPL", "La liga")
+season_start_years <- 2021:2026                # 2021/22 ... 2026/27
+refresh            <- FALSE                    # TRUE = ignore cache, re-download
+pause_seconds      <- 3                        # be polite to Understat
+cache_dir          <- "understat_cache"
+```
+
+## 4. Helpers
+
+Two small helper functions are defined once and used later. `ensure_cols()` adds any expected column that is missing from the downloaded data and fills it with `NA`, so the cleaning code does not fail if Understat or the package changes a column. `season_label()` turns a start year into the usual season label, for example 2025 becomes "2025/26".
+
+```{r helpers}
+ensure_cols <- function(df, cols) {
+  miss <- setdiff(cols, names(df))
+  if (length(miss)) df[miss] <- NA
+  df
+}
+
+season_label <- function(start) paste0(start, "/", substr(start + 1, 3, 4))
+```
+
+## 5. Download
+
+Each league-season is saved to `cache_dir`, so re-running or knitting only
+downloads what is missing.
+
+The download works through each league and season in turn:
+
+1. `expand.grid()` builds every combination of league and season to download.
+2. For each one, the code checks whether a saved copy exists in `cache_dir`. If it does, it loads that copy and moves on (`next`), so nothing is downloaded twice.
+3. Otherwise it calls `understat_league_season_shots()`, labels the rows with the league and season, and saves them as an `.rds` file.
+4. The download is wrapped in `tryCatch()`, so a season that does not exist or fails is recorded in `failures` and skipped instead of stopping the whole run.
+5. A short pause between requests keeps the scraping polite.
+6. `bind_rows()` joins all the seasons into one table, `raw`, and the number of shots and any failures are printed as a check.
+
+```{r download}
+dir.create(cache_dir, showWarnings = FALSE)
+
+jobs     <- expand.grid(lg = leagues, yr = season_start_years, stringsAsFactors = FALSE)
+results  <- vector("list", nrow(jobs))
+failures <- character()
+
+for (i in seq_len(nrow(jobs))) {
+  lg <- jobs$lg[i]; yr <- jobs$yr[i]
+  label <- paste(lg, season_label(yr))
+  f <- file.path(cache_dir, sprintf("shots_%s_%s.rds", gsub(" ", "_", lg), yr))
+
+  if (file.exists(f) && !refresh) {
+    results[[i]] <- readRDS(f)
+    next
+  }
+
+  message(sprintf("[%d/%d] %s", i, nrow(jobs), label))
+  res <- tryCatch({
+    d <- understat_league_season_shots(league = lg, season_start_year = yr)
+    if (is.null(d) || nrow(d) == 0) stop("no rows returned")
+    d$league_name  <- lg
+    d$season_start <- yr
+    d
+  }, error = function(e) {
+    message("  FAILED: ", conditionMessage(e))
+    NULL
+  })
+
+  if (is.null(res)) {
+    failures <- c(failures, label)
+  } else {
+    saveRDS(res, f)
+    results[[i]] <- res
+  }
+  Sys.sleep(pause_seconds)
+}
+
+raw <- bind_rows(results)
+
+cat("Raw shots:", nrow(raw), "\n")
+if (length(failures)) cat("Not available / failed:", paste(failures, collapse = ", "), "\n")
+```
+
+## 6. Clean and add features
+
+Understat gives pitch coordinates as fractions from 0 to 1 (`X` runs towards the
+goal being attacked). Below they're converted to two scales: a StatsBomb-style
+120 x 80 pitch (`x`, `y`) and approximate metres on a 105 x 68 pitch
+(`x_m`, `y_m`), which is used for distance and angle.
+
+The cleaning step has three parts.
+
+1. **Selecting and renaming.** `transmute()` keeps only the columns needed, gives them clearer names and sets the correct types (dates, numbers, text). It also works out the shooting team and the opponent from `h_a` (home or away), because Understat lists each shot under the match rather than under a team. `ensure_cols()` guards against missing columns first.
+2. **Location features.** The coordinates are scaled to a 120 x 80 pitch (`x`, `y`) to match StatsBomb, and to metres (`x_m`, `y_m`). `distance_m` is the straight-line distance to the centre of the goal. `angle_to_goal` is the angle between the lines from the shot to the two goalposts; the goal is 7.32 m wide, so the posts are 3.66 m either side of the centre. A larger angle means a wider view of the goal. Distance and angle are two of the most important inputs for an xG model.
+3. **Flags.** True/false columns are created from the result and the situation (own goal, on target, penalty, set piece, header and so on), because models need these as simple variables.
+
+```{r clean}
+raw_cols <- c("id", "minute", "result", "X", "Y", "xG", "player", "h_a",
+              "player_id", "situation", "shotType", "match_id", "h_team",
+              "a_team", "h_goals", "a_goals", "date", "player_assisted",
+              "lastAction")
+
+shots <- raw %>%
+  ensure_cols(raw_cols) %>%
+  transmute(
+    league       = league_name,
+    season_start,
+    season       = season_label(season_start),
+    match_id     = as.character(match_id),
+    shot_id      = as.character(id),
+    date         = as.Date(substr(as.character(date), 1, 10)),
+    home_team    = h_team,
+    away_team    = a_team,
+    final_home_goals = as.integer(h_goals),
+    final_away_goals = as.integer(a_goals),
+    is_home      = h_a == "h",
+    team         = if_else(h_a == "h", h_team, a_team),
+    opponent     = if_else(h_a == "h", a_team, h_team),
+    player,
+    player_id    = as.character(player_id),
+    assisted_by  = player_assisted,
+    minute       = as.numeric(minute),
+    xg           = as.numeric(xG),
+    result,
+    situation,
+    shot_type    = shotType,
+    last_action  = lastAction,
+    X = as.numeric(X), Y = as.numeric(Y)
+  ) %>%
+  mutate(
+    # coordinates on a StatsBomb-style 120 x 80 pitch
+    x = X * 120,
+    y = Y * 80,
+    # approximate metres on a 105 x 68 pitch
+    x_m = X * 105,
+    y_m = Y * 68,
+    distance_m = sqrt((105 - x_m)^2 + (34 - y_m)^2),
+    angle_to_goal = abs(atan2(34 + 3.66 - y_m, 105 - x_m) -
+                        atan2(34 - 3.66 - y_m, 105 - x_m)),
+    # flags
+    is_goal       = result == "Goal",
+    is_own_goal   = result == "OwnGoal",
+    on_target     = result %in% c("Goal", "SavedShot"),
+    blocked       = result == "BlockedShot",
+    hit_post      = result == "ShotOnPost",
+    is_penalty    = situation == "Penalty",
+    is_open_play  = situation == "OpenPlay",
+    is_set_piece  = situation %in% c("SetPiece", "DirectFreekick", "FromCorner"),
+    from_corner   = situation == "FromCorner",
+    is_free_kick  = situation == "DirectFreekick",
+    is_header     = shot_type == "Head",
+    is_assisted   = !is.na(assisted_by)
+  ) %>%
+  select(-X, -Y)
+```
+
+**Score before each shot.** Understat does not give the score at the time of each shot, so it is calculated from the goals. All goals are listed with the scoring team and the minute. Each shot is then matched to the goals in its match (`left_join()` with `many-to-many`, because a match has many shots and many goals). Goals scored in an earlier minute are counted for the shooting team (`team_goals_before`) and for the opponent (`opp_goals_before`). Own goals are not counted, and a goal in the same minute as a shot is ignored, because the order within a minute is unknown. `score_diff` is the difference between the two, and `game_state` labels the shot as Leading, Level or Trailing. Teams may play differently depending on the score, so this can affect the chance of scoring. `glimpse()` prints the columns as a check.
+
+```{r game-state}
+# Score before each shot (counts goals scored in earlier minutes; own goals are
+# not counted, and shots in the same minute as a goal ignore that goal).
+goals <- shots %>%
+  filter(is_goal) %>%
+  select(match_id, goal_team = team, goal_minute = minute)
+
+game_state <- shots %>%
+  select(shot_id, match_id, team, minute) %>%
+  left_join(goals, by = "match_id", relationship = "many-to-many") %>%
+  group_by(shot_id) %>%
+  summarise(
+    team_goals_before = sum(goal_team == team & goal_minute < minute, na.rm = TRUE),
+    opp_goals_before  = sum(goal_team != team & goal_minute < minute, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+shots <- shots %>%
+  left_join(game_state, by = "shot_id") %>%
+  mutate(
+    score_diff = team_goals_before - opp_goals_before,
+    game_state = case_when(score_diff > 0 ~ "Leading",
+                           score_diff < 0 ~ "Trailing",
+                           TRUE ~ "Level")
+  )
+
+glimpse(shots)
+```
+
+### Features available
+
+The table lists the final columns by group, so it is clear what is available for modelling.
+
+| Group | Columns |
+|---|---|
+| Match | `league`, `season`, `match_id`, `date`, `home_team`, `away_team`, `final_home_goals`, `final_away_goals` |
+| Team / player | `team`, `opponent`, `is_home`, `player`, `player_id`, `assisted_by` |
+| Shot | `minute`, `xg`, `result`, `situation`, `shot_type`, `last_action` |
+| Location | `x`, `y` (120 x 80), `x_m`, `y_m` (metres), `distance_m`, `angle_to_goal` |
+| Flags | `is_goal`, `is_own_goal`, `on_target`, `blocked`, `hit_post`, `is_penalty`, `is_open_play`, `is_set_piece`, `from_corner`, `is_free_kick`, `is_header`, `is_assisted` |
+| Game state | `team_goals_before`, `opp_goals_before`, `score_diff`, `game_state` |
+
+## 7. Summaries
+
+These summaries check the cleaned data and give an overall picture.
+
+The first table gives, for each league and season, the number of matches, shots and goals, the total xG, goals minus xG, and shots per match. Own goals are excluded because they are not genuine shot attempts, so excluding them keeps the shot counts and xG totals comparable. If Understat's xG is well calibrated, goals minus xG should be close to zero over a season.
+
+```{r by-season}
+shots %>%
+  filter(!is_own_goal) %>%
+  group_by(league, season) %>%
+  summarise(
+    matches = n_distinct(match_id),
+    shots   = n(),
+    goals   = sum(is_goal),
+    xg      = round(sum(xg, na.rm = TRUE), 1),
+    goals_minus_xg = round(goals - xg, 1),
+    shots_per_match = round(shots / matches, 1),
+    .groups = "drop"
+  )
+```
+
+This table gives each team's attacking and defensive record per season. `xg_for` and `goals_for` are summed over the team's own shots. For `xg_against` and `goals_against` the same shots are grouped by the opponent instead, because one team's shots are the other team's chances conceded. The two tables are joined, and `xg_diff` (xG for minus xG against) ranks the teams. xG is used rather than goals because it is less affected by chance in finishing, which makes it a better indicator of team performance, the question this project investigates.
+
+```{r team-table}
+xg_for <- shots %>%
+  filter(!is_own_goal) %>%
+  group_by(league, season, team) %>%
+  summarise(matches = n_distinct(match_id), shots = n(),
+            goals_for = sum(is_goal), xg_for = sum(xg, na.rm = TRUE),
+            .groups = "drop")
+
+xg_against <- shots %>%
+  filter(!is_own_goal) %>%
+  group_by(league, season, team = opponent) %>%
+  summarise(shots_against = n(), goals_against = sum(is_goal),
+            xg_against = sum(xg, na.rm = TRUE), .groups = "drop")
+
+team_table <- xg_for %>%
+  left_join(xg_against, by = c("league", "season", "team")) %>%
+  mutate(xg_diff = round(xg_for - xg_against, 1),
+         xg_for = round(xg_for, 1), xg_against = round(xg_against, 1)) %>%
+  arrange(league, season, desc(xg_diff))
+
+team_table
+```
+
+The top 20 players by non-penalty xG. Only players with at least 50 shots are included, so players with very few shots do not appear. Penalties are excluded because they have a high xG and would favour the players who take them. `npxg_per_shot` is the average quality of a player's shots.
+
+```{r top-players}
+shots %>%
+  filter(!is_own_goal, !is_penalty) %>%
+  group_by(player, player_id) %>%
+  summarise(shots = n(), goals = sum(is_goal),
+            npxg = round(sum(xg, na.rm = TRUE), 1),
+            npxg_per_shot = round(npxg / shots, 3), .groups = "drop") %>%
+  filter(shots >= 50) %>%
+  arrange(desc(npxg)) %>%
+  head(20)
+```
+
+Shots are grouped by situation (open play, set piece, penalty and so on), comparing the number of shots, goals, average xG and conversion rate. This shows how different the situations are, for example penalties are converted far more often than other shots. That supports including the situation as a feature, or modelling shot types separately.
+
+```{r situations}
+shots %>%
+  filter(!is_own_goal) %>%
+  group_by(situation) %>%
+  summarise(shots = n(), goals = sum(is_goal),
+            avg_xg = round(mean(xg, na.rm = TRUE), 3),
+            conversion = round(mean(is_goal), 3), .groups = "drop") %>%
+  arrange(desc(shots))
+```
+
+## 8. Plots
+
+This plot compares Understat's average xG (blue bars) with the actual goal rate (red dots) in 2.5 m distance bands, excluding penalties and shots beyond 40 m. Both should fall as distance increases. If the dots sit close to the bars, Understat's xG is well calibrated across distances. Because it uses Understat's own xG, it is also a check on the benchmark our models are compared against.
+
+```{r xg-distance, fig.width=8, fig.height=4.5}
+shots %>%
+  filter(!is_own_goal, !is_penalty, distance_m <= 40) %>%
+  mutate(dist_bin = cut(distance_m, breaks = seq(0, 40, 2.5), include.lowest = TRUE)) %>%
+  group_by(dist_bin) %>%
+  summarise(mean_xg = mean(xg, na.rm = TRUE), goal_rate = mean(is_goal),
+            n = n(), .groups = "drop") %>%
+  ggplot(aes(dist_bin)) +
+  geom_col(aes(y = mean_xg), fill = "steelblue", alpha = 0.7) +
+  geom_point(aes(y = goal_rate), colour = "red", size = 2) +
+  labs(x = "Distance to goal (m)", y = "Mean xG (bars) / goal rate (dots)",
+       title = "xG vs distance") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+This heat map shows where shots are taken in the attacking half (`x >= 60`), excluding penalties and own goals. The penalty area and six-yard box are drawn in white. `scale_y_reverse()` flips the pitch and `coord_fixed()` keeps its proportions. The colour uses a square-root scale so that the busy central areas do not hide the rest. It shows that most shots come from central areas close to goal.
+
+```{r shot-density, fig.width=8, fig.height=5.5}
+shots %>%
+  filter(!is_own_goal, !is_penalty, x >= 60) %>%
+  ggplot(aes(x, y)) +
+  geom_bin2d(binwidth = c(2, 2)) +
+  scale_fill_viridis_c(option = "magma", trans = "sqrt", name = "Shots") +
+  annotate("rect", xmin = 102, xmax = 120, ymin = 18, ymax = 62, fill = NA, colour = "white") +
+  annotate("rect", xmin = 114, xmax = 120, ymin = 30, ymax = 50, fill = NA, colour = "white") +
+  coord_fixed(xlim = c(60, 120), ylim = c(0, 80)) +
+  scale_y_reverse() +
+  labs(title = "Shot locations", x = NULL, y = NULL) +
+  theme_minimal()
+```
+
+This bar chart shows each team's goals minus xG for the most recent season in the data. Green bars mean a team scored more than expected and red bars fewer. A difference can come from finishing skill or from chance, so this is a starting point rather than a verdict, and it leads into the later team heat maps.
+
+```{r over-under, fig.width=8, fig.height=6}
+latest <- max(team_table$season)
+team_table %>%
+  filter(season == latest) %>%
+  mutate(over_under = goals_for - xg_for,
+         team = reorder(team, over_under)) %>%
+  ggplot(aes(team, over_under, fill = over_under > 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_manual(values = c("firebrick", "seagreen")) +
+  labs(title = paste("Goals minus xG,", latest), x = NULL, y = "Goals - xG") +
+  theme_minimal()
+```
+
+## 9. Save
+
+The cleaned shots are saved as a CSV file, which every group member can use, including in Python, and as an `.rds` file, which R loads faster and which keeps the column types (such as dates).
+
+```{r save}
+write.csv(shots, "understat_shots.csv", row.names = FALSE)
+saveRDS(shots, "understat_shots.rds")
+```
+
+## Optional: faster pre-scraped data
+
+`worldfootballR` also hosts pre-scraped Understat shots, which load in seconds
+but may lag behind the live site. Run this by hand if scraping is slow, then
+assign the result to `raw` and re-run the cleaning chunk onwards.
+
+This chunk is not run by default (`eval=FALSE`). It is only an alternative way to obtain the raw data.
+
+```{r prescraped, eval=FALSE}
+raw <- load_understat_league_shots(league = "EPL") %>%
+  mutate(league_name  = "EPL",
+         season_start = as.integer(season)) %>%
+  filter(season_start %in% season_start_years)
+```

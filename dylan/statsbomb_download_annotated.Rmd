@@ -1,0 +1,527 @@
+---
+title: "StatsBomb Shot Data - Premier League"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+This notebook downloads StatsBomb's free open data, extracts every shot, adds features, and saves the result as a CSV file. StatsBomb has a wider range of features than Understat, such as the positions of the defenders and the goalkeeper at the moment of each shot (the "freeze frame"). However, it has fewer shots, more missing values, and some older seasons. It was therefore explored as an alternative data source, and Understat was used for the main models.
+
+The notebook follows its sections: install the package, load the libraries, choose settings, list the competitions, define helper functions, define a function that processes one season, download and cache all seasons, summarise the data, plot it, and save it.
+
+## 1. Install packages (run once, manually)
+
+`remotes` installs packages from GitHub. `StatsBombR` is StatsBomb's package for downloading and cleaning their open data and is installed from GitHub. `dplyr`, `tidyr` and `ggplot2` are used for data manipulation and plotting. The chunk has `eval=FALSE`, so it is only run by hand once.
+
+```{r install, eval=FALSE}
+install.packages(c("remotes", "dplyr", "tidyr", "ggplot2"))
+remotes::install_github("statsbomb/StatsBombR")
+```
+
+## 2. Load libraries
+
+The packages are loaded for use in the rest of the notebook. `StatsBombR` downloads and cleans the data, and `dplyr` and `tidyr` reshape and summarise it. The comment on `dplyr` records that version 1.1.0 or later is needed, because the code later uses the `relationship` argument of `left_join()`. `ggplot2` draws the plots.
+
+```{r libraries}
+library(StatsBombR)
+library(dplyr)    # needs dplyr >= 1.1.0
+library(tidyr)
+library(ggplot2)
+```
+
+## 3. Settings
+
+By default this pulls **every free competition and season**, men's and women's.
+The first run is slow, so each season is saved to `cache_dir` and reused on
+later knits. Narrow things down here if you want a faster run.
+
+The settings are collected in one place so the notebook can be rerun for different data without editing the code below. Here the data is limited to the Premier League through `only_competitions`. `refresh` controls whether saved data is reused, `use_parallel` chooses whether to download in parallel, and `cache_dir` is the folder where the finished seasons are saved.
+
+```{r settings}
+only_gender       <- NULL   # "male", "female", or NULL for both
+only_competitions <- "Premier League"   # NULL = all competitions
+only_seasons      <- NULL   # e.g. c("2015/2016", "2018")
+refresh           <- FALSE  # TRUE = ignore the cache and re-download everything
+use_parallel      <- FALSE  # TRUE can be faster, but may fail when knitting on Windows
+cache_dir         <- "statsbomb_cache"
+```
+
+## 4. Competitions
+
+`FreeCompetitions()` lists every competition and season that StatsBomb makes freely available. The `if` statements then narrow the list using the settings above, and `filter()` keeps only the matching rows. The final `select()` shows which competitions and seasons will be downloaded, so this can be checked before the slow download starts.
+
+```{r competitions}
+competitions <- FreeCompetitions()
+
+if (!is.null(only_gender))
+  competitions <- filter(competitions, competition_gender %in% only_gender)
+if (!is.null(only_competitions))
+  competitions <- filter(competitions, competition_name %in% only_competitions)
+if (!is.null(only_seasons))
+  competitions <- filter(competitions, season_name %in% only_seasons)
+
+competitions %>%
+  select(competition_id, season_id, competition_name, season_name,
+         any_of("competition_gender"))
+```
+
+## 5. Helper functions
+
+Three helper functions are defined first. They are used when processing each season.
+
+`ensure_cols()` adds any expected column that is missing and fills it with `NA`, so the code does not break if different versions of the data have different columns. StatsBomb also stores locations as lists of numbers, such as (x, y), or (x, y, z) for where a shot ends. `get_coord()` takes the i-th number from each list and returns `NA` where it is missing, which gives ordinary numeric columns.
+
+```{r helpers}
+# Add any missing columns as NA so older/newer data versions don't break us
+ensure_cols <- function(df, cols) {
+  miss <- setdiff(cols, names(df))
+  if (length(miss)) df[miss] <- NA
+  df
+}
+
+# Pull the i-th value out of a list column of c(x, y, z) vectors
+get_coord <- function(lst, i) {
+  vapply(lst, function(l) {
+    if (length(l) >= i) as.numeric(l[[i]]) else NA_real_
+  }, numeric(1))
+}
+```
+
+`point_in_triangle()` tests whether a point lies inside a triangle. It calculates one value for each side of the triangle, and the point is inside if these values are not a mixture of positive and negative. It is used to count the opponents standing in the triangle between the shot and the two goalposts, in other words the players who are in the way of the shot.
+
+```{r helpers-triangle}
+# Is point (px, py) inside triangle (a, b, c)?
+point_in_triangle <- function(px, py, ax, ay, bx, by, cx, cy) {
+  d1 <- (px - bx) * (ay - by) - (ax - bx) * (py - by)
+  d2 <- (px - cx) * (by - cy) - (bx - cx) * (py - cy)
+  d3 <- (px - ax) * (cy - ay) - (cx - ax) * (py - ay)
+  has_neg <- (d1 < 0) | (d2 < 0) | (d3 < 0)
+  has_pos <- (d1 > 0) | (d2 > 0) | (d3 > 0)
+  !(has_neg & has_pos)
+}
+```
+
+`freeze_features()` turns the freeze frame of one shot, which records where the visible players were at that moment, into numbers. It first separates the players into teammates, the goalkeeper and outfield opponents, because only outfield opponents count as defenders. It then counts the opponents and teammates in the frame, the opponents inside the shot triangle (the posts are at y = 36 and y = 44 on the goal line at x = 120, as the goal is 8 units wide and centred at y = 40) and the opponents within 3 units of the shot, and finds the distance to the nearest opponent. For the goalkeeper it returns the position and the distance from the centre of the goal. If the freeze frame is missing it returns `NA`. This is the kind of defender information that the Understat data does not provide.
+
+```{r helpers-freeze}
+# Features from the shot "freeze frame" (positions of players at the moment of the shot)
+freeze_features <- function(ff, sx, sy) {
+  out <- list(
+    opponents_in_frame    = NA_integer_,  # outfield opponents visible
+    teammates_in_frame    = NA_integer_,
+    opps_in_shot_triangle = NA_integer_,  # outfield opponents between shot and both posts
+    opps_within_3m        = NA_integer_,
+    nearest_opp_dist      = NA_real_,
+    gk_x                  = NA_real_,
+    gk_y                  = NA_real_,
+    gk_dist_to_goal       = NA_real_
+  )
+  if (!is.data.frame(ff) || nrow(ff) == 0 || is.na(sx) || is.na(sy))
+    return(as_tibble(out))
+
+  loc <- ff$location
+  if (is.list(loc)) loc <- do.call(rbind, lapply(loc, function(l) as.numeric(l)[1:2]))
+  if (is.data.frame(loc)) loc <- as.matrix(loc)
+  if (is.null(loc) || nrow(loc) == 0) return(as_tibble(out))
+
+  px <- loc[, 1]; py <- loc[, 2]
+  tm  <- if ("teammate" %in% names(ff)) ff$teammate %in% TRUE else rep(FALSE, nrow(ff))
+  pos <- if ("position.name" %in% names(ff)) ff$position.name else rep(NA_character_, nrow(ff))
+
+  gk       <- !tm & (pos %in% "Goalkeeper")
+  opp_out  <- !tm & !gk
+  d        <- sqrt((px - sx)^2 + (py - sy)^2)
+  in_tri   <- point_in_triangle(px, py, sx, sy, 120, 36, 120, 44)
+
+  out$opponents_in_frame    <- sum(opp_out)
+  out$teammates_in_frame    <- sum(tm)
+  out$opps_in_shot_triangle <- sum(opp_out & in_tri)
+  out$opps_within_3m        <- sum(opp_out & d <= 3)
+  out$nearest_opp_dist      <- if (any(opp_out)) min(d[opp_out]) else NA_real_
+  if (any(gk)) {
+    out$gk_x <- px[gk][1]
+    out$gk_y <- py[gk][1]
+    out$gk_dist_to_goal <- sqrt((120 - out$gk_x)^2 + (40 - out$gk_y)^2)
+  }
+  as_tibble(out)
+}
+```
+
+## 6. Function that processes one competition-season
+
+For each season it downloads all events, then keeps shots plus the pass that
+created each shot (the "key pass"), and adds extra features.
+
+First, three vectors list the columns to keep from the shot events (`shot_cols`), from the pass events (`pass_cols`) and from the match table (`match_cols`). Listing them in advance shows exactly which fields are used, and `ensure_cols()` fills any that are missing in a particular season.
+
+```{r process}
+shot_cols <- c(
+  "id", "index", "match_id", "team.name", "player.name", "player.id",
+  "position.name", "minute", "second", "period", "possession",
+  "possession_team.name", "play_pattern.name", "under_pressure",
+  "location", "location.x", "location.y",
+  "shot.statsbomb_xg", "shot.outcome.name", "shot.body_part.name",
+  "shot.type.name", "shot.technique.name", "shot.first_time",
+  "shot.one_on_one", "shot.aerial_won", "shot.follows_dribble",
+  "shot.redirect", "shot.deflected", "shot.open_goal",
+  "shot.key_pass_id", "shot.end_location", "shot.freeze_frame"
+)
+
+pass_cols <- c(
+  "id", "player.name", "position.name", "location", "pass.end_location",
+  "pass.length", "pass.angle", "pass.height.name", "pass.body_part.name",
+  "pass.type.name", "pass.technique.name", "pass.cross", "pass.through_ball",
+  "pass.cut_back", "pass.switch", "pass.goal_assist"
+)
+
+match_cols <- c(
+  "match_id", "match_date", "kick_off", "match_week",
+  "competition.competition_name", "competition.country_name",
+  "season.season_name", "competition_stage.name", "stadium.name",
+  "referee.name", "home_team.home_team_name", "away_team.away_team_name",
+  "home_score", "away_score"
+)
+```
+
+The function `process_season()` then works through one competition-season in these steps:
+
+1. **Download.** `FreeMatches()` gets the list of matches, `free_allevents()` downloads every event in those matches, and `allclean()` applies StatsBombR's standard clean-up.
+2. **Shots.** Only shot events are kept. The shot coordinates are taken from `location.x` and `location.y`, or from the location list if those are missing. Each shot's freeze frame is converted into defender and goalkeeper features with `freeze_features()`. The columns are renamed, and the distance and angle to goal are calculated for a goal centred at x = 120, y = 40. Penalties, headers and the other flags are created as true/false columns.
+3. **The pass that created the shot.** Each shot stores the ID of the pass that led to it (`shot.key_pass_id`). These passes are looked up in the events and their details (type, length, height, cross, through ball and so on) are joined to the shot.
+4. **Score at the time of the shot.** All goals, including own goals and excluding penalty shootouts, are listed in order. Each shot is matched to the goals earlier in the same match, using the event order, so the score is exact for each shot and not just by minute. This gives `team_goals_before`, `opp_goals_before`, `score_diff` and `game_state`.
+5. **Match details.** Information about the match (teams, date, competition, season, stage and so on) is joined on, and `is_home` and the opponent are worked out.
+
+```{r process-season}
+process_season <- function(comp_row) {
+
+  # Get the matches, download every event in them, then apply StatsBombR's standard clean-up
+  matches <- FreeMatches(comp_row)
+  events  <- free_allevents(MatchesDF = matches, Parallel = use_parallel)
+  events  <- allclean(events)
+
+  # ---- Shots ----
+  sh <- events %>%
+    filter(type.name == "Shot") %>%
+    ensure_cols(shot_cols)
+  if (nrow(sh) == 0) return(NULL)
+
+  # Shot coordinates: use location.x/location.y if available, otherwise take them from the location list
+  sh$sx <- if ("location.x" %in% names(sh) && !all(is.na(sh$location.x)))
+    as.numeric(sh$location.x) else get_coord(sh$location, 1)
+  sh$sy <- if ("location.y" %in% names(sh) && !all(is.na(sh$location.y)))
+    as.numeric(sh$location.y) else get_coord(sh$location, 2)
+
+  # Turn each shot's freeze frame into defender and goalkeeper features (one row per shot)
+  freeze <- bind_rows(Map(freeze_features, sh$shot.freeze_frame, sh$sx, sh$sy))
+
+  # Select and rename the shot columns, and calculate distance and angle to goal
+  # (goal centre at x = 120, y = 40; goalposts at y = 36 and y = 44)
+
+  shots <- sh %>%
+    transmute(
+      event_id        = id,
+      event_index     = index,
+      match_id,
+      team            = team.name,
+      player          = player.name,
+      player_id       = player.id,
+      position        = position.name,
+      period, minute, second,
+      time            = minute + second / 60,
+      possession,
+      possession_team = possession_team.name,
+      play_pattern    = play_pattern.name,
+      under_pressure  = under_pressure %in% TRUE,
+      x = sx, y = sy,
+      distance_to_goal = sqrt((120 - sx)^2 + (40 - sy)^2),
+      angle_to_goal    = abs(atan2(44 - sy, 120 - sx) - atan2(36 - sy, 120 - sx)),
+      end_x = get_coord(shot.end_location, 1),
+      end_y = get_coord(shot.end_location, 2),
+      end_z = get_coord(shot.end_location, 3),
+      xg              = as.numeric(shot.statsbomb_xg),
+      outcome         = shot.outcome.name,
+      is_goal         = shot.outcome.name %in% "Goal",
+      on_target       = tolower(shot.outcome.name) %in% c("goal", "saved", "saved to post"),
+      body_part       = shot.body_part.name,
+      shot_type       = shot.type.name,
+      technique       = shot.technique.name,
+      is_penalty      = shot.type.name %in% "Penalty",
+      is_header       = shot.body_part.name %in% "Head",
+      first_time      = shot.first_time %in% TRUE,
+      one_on_one      = shot.one_on_one %in% TRUE,
+      aerial_won      = shot.aerial_won %in% TRUE,
+      follows_dribble = shot.follows_dribble %in% TRUE,
+      redirect        = shot.redirect %in% TRUE,
+      deflected       = shot.deflected %in% TRUE,
+      open_goal       = shot.open_goal %in% TRUE,
+      key_pass_id     = as.character(shot.key_pass_id)
+    ) %>%
+    bind_cols(freeze)
+
+  # ---- The pass that created each shot ----
+  # shot.key_pass_id points to the pass event that led to the shot, so those passes are looked up and joined on
+  kp_ids <- unique(na.omit(shots$key_pass_id))
+  assists <- events %>%
+    filter(id %in% kp_ids) %>%
+    ensure_cols(pass_cols) %>%
+    transmute(
+      key_pass_id     = as.character(id),
+      assist_player   = player.name,
+      assist_position = position.name,
+      assist_start_x  = get_coord(location, 1),
+      assist_start_y  = get_coord(location, 2),
+      assist_end_x    = get_coord(pass.end_location, 1),
+      assist_end_y    = get_coord(pass.end_location, 2),
+      assist_length   = as.numeric(pass.length),
+      assist_angle    = as.numeric(pass.angle),
+      assist_height   = pass.height.name,
+      assist_body_part = pass.body_part.name,
+      assist_type     = pass.type.name,       # Corner, Free Kick, Throw-in, ...
+      assist_technique = pass.technique.name,
+      assist_cross    = pass.cross %in% TRUE,
+      assist_through_ball = pass.through_ball %in% TRUE,
+      assist_cut_back = pass.cut_back %in% TRUE,
+      assist_switch   = pass.switch %in% TRUE,
+      is_goal_assist  = pass.goal_assist %in% TRUE
+    ) %>%
+    distinct(key_pass_id, .keep_all = TRUE)
+
+  shots <- left_join(shots, assists, by = "key_pass_id")
+
+  # ---- Score at the moment of the shot ----
+  # Goals (including own goals, excluding shootouts) are compared by event order, so the score is exact for each shot
+  goals <- events %>%
+    filter(period < 5,
+           (type.name %in% "Shot" & shot.outcome.name %in% "Goal") |
+             type.name %in% "Own Goal For") %>%
+    select(match_id, goal_team = team.name, goal_index = index)
+
+  game_state <- shots %>%
+    select(event_id, match_id, team, event_index) %>%
+    left_join(goals, by = "match_id", relationship = "many-to-many") %>%
+    group_by(event_id) %>%
+    summarise(
+      team_goals_before = sum(goal_team == team & goal_index < event_index, na.rm = TRUE),
+      opp_goals_before  = sum(goal_team != team & goal_index < event_index, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  shots <- shots %>%
+    left_join(game_state, by = "event_id") %>%
+    mutate(
+      score_diff = team_goals_before - opp_goals_before,
+      game_state = case_when(score_diff > 0 ~ "Leading",
+                             score_diff < 0 ~ "Trailing",
+                             TRUE ~ "Level"),
+      is_shootout = period == 5
+    )
+
+  # ---- Match / competition info ----
+  # Join match details (teams, date, competition, season), then work out home/away and the opponent
+  mi <- matches %>%
+    ensure_cols(match_cols) %>%
+    transmute(
+      match_id, match_date, kick_off, match_week,
+      competition = competition.competition_name,
+      country     = competition.country_name,
+      season      = season.season_name,
+      stage       = competition_stage.name,
+      stadium     = stadium.name,
+      referee     = referee.name,
+      home_team   = home_team.home_team_name,
+      away_team   = away_team.away_team_name,
+      home_score, away_score
+    ) %>%
+    mutate(competition_gender = if ("competition_gender" %in% names(comp_row))
+      as.character(comp_row$competition_gender) else NA_character_)
+
+  shots %>%
+    left_join(mi, by = "match_id") %>%
+    mutate(
+      is_home  = team == home_team,
+      opponent = if_else(is_home, away_team, home_team)
+    ) %>%
+    relocate(competition, competition_gender, season, stage, match_id,
+             match_date, home_team, away_team, team, opponent, is_home)
+}
+```
+
+## 7. Download everything
+
+Run this chunk interactively the first time and expect a long wait (it is a lot
+of data). Finished seasons are cached in `cache_dir`, so re-running or knitting
+afterwards is fast and resumes where it left off.
+
+The download works through each competition-season in turn:
+
+1. For each one, the code checks whether a saved copy exists in `cache_dir`. If it does, it loads that copy and moves on (`next`), so nothing is downloaded twice.
+2. Otherwise it runs `process_season()` and saves the result as an `.rds` file.
+3. The call is wrapped in `tryCatch()`, so a season that fails is recorded in `failures` and skipped instead of stopping the whole run.
+4. `bind_rows()` joins all the seasons into one table, `shots`, and the number of shots and matches, and any failed seasons, are printed as a check.
+
+```{r download}
+dir.create(cache_dir, showWarnings = FALSE)
+results  <- vector("list", nrow(competitions))
+failures <- character()
+
+for (i in seq_len(nrow(competitions))) {
+  comp  <- competitions[i, ]
+  label <- paste(comp$competition_name, comp$season_name)
+  f <- file.path(cache_dir,
+                 sprintf("shots_%s_%s.rds", comp$competition_id, comp$season_id))
+
+  if (file.exists(f) && !refresh) {
+    results[[i]] <- readRDS(f)
+    next
+  }
+
+  message(sprintf("[%d/%d] %s", i, nrow(competitions), label))
+  res <- tryCatch(process_season(comp), error = function(e) {
+    message("  FAILED: ", conditionMessage(e))
+    NULL
+  })
+
+  if (is.null(res)) {
+    failures <- c(failures, label)
+  } else {
+    saveRDS(res, f)
+    results[[i]] <- res
+  }
+}
+
+shots <- bind_rows(results)
+
+cat("Shots:", nrow(shots), "| Matches:", n_distinct(shots$match_id),
+    "| Competition-seasons failed/empty:", length(failures), "\n")
+if (length(failures)) print(failures)
+```
+
+## 8. What's in the data
+
+Beyond the raw StatsBomb fields, these features are added:
+
+| Group | Columns |
+|---|---|
+| Shot basics | `x`, `y`, `end_x`, `end_y`, `end_z` (shot height), `xg`, `outcome`, `is_goal`, `on_target`, `body_part`, `shot_type`, `technique`, `play_pattern`, `position` |
+| Geometry | `distance_to_goal`, `angle_to_goal` (radians, angle the goal subtends) |
+| Flags | `is_penalty`, `is_header`, `first_time`, `one_on_one`, `open_goal`, `aerial_won`, `follows_dribble`, `redirect`, `deflected`, `under_pressure` |
+| Defensive picture (freeze frame) | `opps_in_shot_triangle`, `opps_within_3m`, `nearest_opp_dist`, `opponents_in_frame`, `teammates_in_frame`, `gk_x`, `gk_y`, `gk_dist_to_goal` |
+| Creating pass | `assist_player`, `assist_type`, `assist_height`, `assist_length`, `assist_cross`, `assist_through_ball`, `assist_cut_back`, `is_goal_assist`, and start/end coordinates |
+| Game context | `team_goals_before`, `opp_goals_before`, `score_diff`, `game_state`, `time`, `period`, `is_shootout` |
+| Match context | `competition`, `competition_gender`, `country`, `season`, `stage`, `stadium`, `referee`, `home_team`, `away_team`, `is_home`, `opponent`, `match_date`, `kick_off`, `home_score`, `away_score` |
+
+Pitch coordinates are on a 120 x 80 pitch, with the attacking goal at x = 120.
+Shots from penalty shootouts are flagged by `is_shootout`.
+
+`glimpse()` lists every column with its type and the first few values, as a check of the final table.
+
+```{r glimpse}
+glimpse(shots)
+```
+
+## 9. Summaries
+
+These summaries check the data and give an overall picture.
+
+The first table gives the number of matches, shots and goals, the total xG, and goals minus xG for each competition and season. Penalty shootouts are excluded (`!is_shootout`) because they are not part of normal play. If StatsBomb's xG is well calibrated, goals minus xG should be close to zero.
+
+```{r by-competition}
+shots %>%
+  filter(!is_shootout) %>%
+  group_by(competition, season) %>%
+  summarise(
+    matches = n_distinct(match_id),
+    shots   = n(),
+    goals   = sum(is_goal),
+    xg      = round(sum(xg, na.rm = TRUE), 1),
+    goals_minus_xg = round(goals - xg, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(shots))
+```
+
+The top 20 players by non-penalty xG. Only players with at least 50 shots are included, so players with very few shots do not appear. Penalties are excluded because they have a high xG and would favour the players who take them. `npxg_per_shot` is the average quality of a player's shots.
+
+```{r top-players}
+shots %>%
+  filter(!is_shootout, !is_penalty) %>%
+  group_by(player) %>%
+  summarise(
+    shots = n(),
+    goals = sum(is_goal),
+    npxg  = round(sum(xg, na.rm = TRUE), 1),
+    npxg_per_shot = round(npxg / shots, 3),
+    .groups = "drop"
+  ) %>%
+  filter(shots >= 50) %>%
+  arrange(desc(npxg)) %>%
+  head(20)
+```
+
+This table summarises each team in each match: shots, shots on target, goals and total xG. It gives a match-level view of team performance that can be aggregated to a season, and `head()` shows the first 10 rows.
+
+```{r team-match}
+shot_summary <- shots %>%
+  filter(!is_shootout) %>%
+  group_by(competition, season, match_id, match_date, team, opponent) %>%
+  summarise(
+    shots    = n(),
+    on_target = sum(on_target),
+    goals    = sum(is_goal),
+    xg       = round(sum(xg, na.rm = TRUE), 2),
+    .groups  = "drop"
+  )
+head(shot_summary, 10)
+```
+
+## 10. Plots
+
+This plot compares StatsBomb's average xG (blue bars) with the actual goal rate (red dots) in distance bands of 2.5 units (the pitch is 120 x 80 units, which are yards), excluding penalties and shootouts. Both should fall as distance increases. If the dots sit close to the bars, StatsBomb's xG is well calibrated across distances.
+
+```{r xg-distance, fig.width=8, fig.height=4.5}
+shots %>%
+  filter(!is_shootout, !is_penalty, !is.na(xg)) %>%
+  mutate(dist_bin = cut(distance_to_goal, breaks = seq(0, 50, 2.5), include.lowest = TRUE)) %>%
+  filter(!is.na(dist_bin)) %>%
+  group_by(dist_bin) %>%
+  summarise(mean_xg = mean(xg), goal_rate = mean(is_goal), n = n(), .groups = "drop") %>%
+  ggplot(aes(dist_bin)) +
+  geom_col(aes(y = mean_xg), fill = "steelblue", alpha = 0.7) +
+  geom_point(aes(y = goal_rate), colour = "red", size = 2) +
+  labs(x = "Distance to goal (yards)", y = "Mean xG (bars) / actual goal rate (dots)",
+       title = "xG vs distance") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+This heat map shows where shots are taken in the attacking half (`x >= 60`), excluding penalties and shootouts. The penalty area and six-yard box are drawn in white. `scale_y_reverse()` flips the pitch and `coord_fixed()` keeps its proportions. The colour uses a square-root scale so that the busy central areas do not hide the rest.
+
+```{r shot-density, fig.width=8, fig.height=5.5}
+shots %>%
+  filter(!is_shootout, !is_penalty, !is.na(x), !is.na(y), x >= 60) %>%
+  ggplot(aes(x, y)) +
+  geom_bin2d(binwidth = c(2, 2)) +
+  scale_fill_viridis_c(option = "magma", trans = "sqrt", name = "Shots") +
+  annotate("rect", xmin = 102, xmax = 120, ymin = 18, ymax = 62, fill = NA, colour = "white") +
+  annotate("rect", xmin = 114, xmax = 120, ymin = 30, ymax = 50, fill = NA, colour = "white") +
+  coord_fixed(xlim = c(60, 120), ylim = c(0, 80)) +
+  scale_y_reverse() +
+  labs(title = "Shot locations", x = NULL, y = NULL) +
+  theme_minimal()
+```
+
+## 11. Save
+
+The shots are saved as a CSV file, which every group member can use, including in Python, and as an `.rds` file, which R loads faster and which keeps the column types.
+
+```{r save}
+write.csv(shots, "statsbomb_shots_all.csv", row.names = FALSE)
+saveRDS(shots, "statsbomb_shots_all.rds")
+```
