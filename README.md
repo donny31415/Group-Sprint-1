@@ -13,7 +13,7 @@
 
 Expected goals (xG) gives every shot a probability of being scored, based on factors such as where it was taken from and how it was taken [1]. Comparing the goals a team actually scores with its xG shows whether it is finishing better or worse than the quality of its chances suggests.
 
-We built four classification models to predict whether a shot is scored, using Premier League shot data from Understat [2]. Each model was trained on the 2021/22 to 2024/25 seasons and tested on the same 2025/26 season, then scored with Brier score, log loss and ROC-AUC. The neural network performed best, so we used its predictions to create attacking and defensive xG heat maps for every Premier League team in 2025/26 [3].
+We built four classification models to predict whether a shot is scored, using Premier League shot data from Understat [2]. Each model was trained on the 2021/22 to 2024/25 seasons and tested on the same 2025/26 season, then scored with Brier score, log loss and ROC-AUC. The neural network performed best, so we used its predictions to create attacking and defensive xG heat maps for every Premier League team in 2025/26 [3] in order to analyse their strengths and weaknesses on the pitch.
 
 ## Reading order
 
