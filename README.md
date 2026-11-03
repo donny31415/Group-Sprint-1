@@ -23,6 +23,7 @@ The data is in the `data/` directory and should be read in this order:
 
 1. `understat_shots.csv`: the original shot data collected from Understat
 2. `shots_cleaned.csv`: the cleaned and processed data used by every model
+   Note that there is also `statsbomb_shots_all.csv` in `data/`. This was the initial dataset for the project but after inspection, we concluded `understat_shots.csv` is the more suitable dataset.
 
 ### Report
 
