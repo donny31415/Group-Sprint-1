@@ -11,9 +11,9 @@
 
 **By exploring different xG models, how can we assess where on the pitch teams are under/over performing?**
 
-Expected goals (xG) gives every shot a probability of being scored, based on factors such as where it was taken from and how it was taken [1]. Comparing the goals a team actually scores with its xG shows whether it is finishing better or worse than the quality of its chances suggests.
+Expected goals (xG) gives every shot a probability of being scored, based on factors such as where it was taken from and how it was taken [1]. Comparing the goals a team actually scores with its xG shows whether they are finishing better or worse than the quality of its chances suggests.
 
-We built four classification models to predict whether a shot is scored, using Premier League shot data from Understat [2]. Each model was trained on the 2021/22 to 2024/25 seasons and tested on the same 2025/26 season, then scored with Brier score, log loss and ROC-AUC. The neural network performed best, so we used its predictions to create attacking and defensive xG heat maps for every Premier League team in 2025/26 [3] in order to analyse their strengths and weaknesses on the pitch.
+We built four classification models to predict whether a shot is scored, using Premier League shot data from Understat [2]. Each model was trained on the 2021/22 to 2024/25 seasons and tested on the same 2025/26 season, then scored with Brier score, log loss and ROC-AUC. The neural network performed best so we used its predictions to create attacking and defensive xG heat maps for every Premier League team in 2025/26 [3] in order to analyse their strengths and weaknesses on the pitch.
 
 ## Reading order
 
@@ -25,22 +25,22 @@ The data is in the `data/` directory and should be read in this order:
 2. `shots_cleaned.csv`: the cleaned and processed data used by every model
 
    
-   Note that there is also `statsbomb_shots_all.csv` in `data/`. This was the initial dataset for the project but after inspection, we concluded `understat_shots.csv` is the more suitable dataset. We have included this in `data/` so that it can be compared with `understat_shots.csv`.
+   Note that there is also `statsbomb_shots_all.csv` in `data/`. This was the initial dataset for the project but after inspection, we concluded that `understat_shots.csv` is the more suitable dataset. We have included this in `data/` so that it can be compared with `understat_shots.csv` if need be.
 
 ### Report
 
 All report content is in the `report/` directory and should be read in this order:
 
-1. `01_Introduction.ipynb`
+1. `01_introduction.ipynb`
 2. `02_data_processing.ipynb`
 3. `03_logistic_regression.ipynb`
-4. `04_Gradient_Boosting.ipynb`
+4. `04_gradient_boosting.ipynb`
 5. `05_random_forest.ipynb`
-6. `06_neural_networks`
+6. `06_neural_networks.html`
 7. `07_comparison_and_analysis.ipynb`
 8. `08_heatmaps.ipynb`
 
-The introduction and data processing should be read first. The four model notebooks (03 to 06) can be read in any order. The comparison and analysis notebook brings the models together and includes our conclusions, and the heat maps notebook uses the best model (the neural network) to look at where each team over- and underperforms.
+The introduction and data processing should be read first. The four model notebooks (03 to 06) can be read in any order however we have ordered it in terms of simplicity of the models (logistic regression being the simplest). The comparison and analysis notebook brings the models together and includes our conclusions. The heat maps notebook uses the best model (the neural network) to look at where each team over- and underperforms.
 
 ### Results
 
