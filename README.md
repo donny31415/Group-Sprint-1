@@ -20,5 +20,5 @@ Plan:
 ## References ##
 
 - what is xg https://www.bbc.co.uk/sport/football/articles/cgrqd18q0rgo
-- link understat 
+- link understat https://understat.com/
 - Heat maps: https://soccermatics.readthedocs.io/en/latest/gallery/lesson2/plot_xGModelFit.html#plotting-shot-location
