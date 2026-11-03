@@ -43,6 +43,14 @@ The introduction and data processing should be read first. The four model notebo
 
 The `results/` directory holds each model's xG predictions for the 2025/26 season, the performance analysis table, and the attacking and defensive heat map images.
 
+### Preparation
+
+The modelling notebooks (R Markdown and Python) are designed to run without editing any file paths. They read the cleaned shot data (`data/shots_cleaned.csv`) and, for the R Markdown files, the bibliography from this repository, using a local copy if one is available and otherwise downloading it from GitHub. An internet connection is therefore needed the first time they are run. The R Markdown files install any missing R packages automatically; [the Python notebooks need `pip install -r requirements.txt` first / install their own packages -- delete as appropriate]. R and RStudio (which includes Pandoc) are needed to knit the R Markdown files.
+
+Any outputs (figures and prediction files) are created in an `outputs` folder next to the notebook that produced them. They are not needed to run anything else, because the final versions are already included in this repository.
+
+The data-collection notebooks (`understat_download` and `statsbomb_download`), which are in Dylan's folder are the exception. They scrape the websites directly, their install chunks must be run by hand, and they can take a long time. They are only needed to reproduce the raw data, which is already saved in `data/`.
+
 ## Requirements
 
 The Python notebooks use the packages listed below:
