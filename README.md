@@ -66,7 +66,7 @@ The R neural network model uses:
 ## Who did what
 
 - **Don**: data cleaning and processing, logistic regression model
-- **Dylan**: neural network model in R
+- **Dylan**: neural network model in R and explored suitability of datasets.
 - **Luke**: random forest model, heat maps
 - **Pietro**: gradient boosting model
 
