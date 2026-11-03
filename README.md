@@ -21,4 +21,4 @@ Plan:
 
 - Jonty Colman BBC, September 2025, What is xG in football and how does it work?, https://www.bbc.co.uk/sport/football/articles/cgrqd18q0rgo
 - Understat (2026) Understat: Advanced Football Statistics. Available at: https://understat.com.
-- Heat maps: https://soccermatics.readthedocs.io/en/latest/gallery/lesson2/plot_xGModelFit.html#plotting-shot-location
+- Heat maps Soccermatics, 2022, David Sumpter (code and text), Aleksander Andrzejewski (code), https://soccermatics.readthedocs.io/en/latest/gallery/lesson2/plot_xGModelFit.html#plotting-shot-location
