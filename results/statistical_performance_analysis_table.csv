@@ -1,0 +1,7 @@
+Model,Brier score,Log loss,ROC-AUC,Accuracy (0.5 cut-off)
+Understat xG,0.0756,0.2671,0.8014,0.8994
+Neural network,0.0783,0.277,0.7809,0.9033
+Gradient boosting,0.0785,0.2787,0.7763,0.9048
+Random forest,0.0789,0.279,0.7773,0.9044
+Logistic regression,0.0791,0.2819,0.7718,0.9038
+Constant baseline,0.0947,0.3379,0.5,0.8941
