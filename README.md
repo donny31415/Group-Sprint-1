@@ -73,21 +73,21 @@ The data-processing notebook documents the steps taken to prepare the final mode
 
 Each observation represents an individual football shot. The response variable is binary:
 
-\[
+$$
 Y_i =
 \begin{cases}
 1, & \text{if shot } i \text{ results in a goal},\\
 0, & \text{otherwise}.
 \end{cases}
-\]
+$$
 
 The models estimate the conditional probability
 
-\[
+$$
 p_i = \mathbb{P}(Y_i=1\mid X_i),
-\]
+$$
 
-where \(X_i\) represents the available shot characteristics and contextual information.
+where $X_i$ represents the available shot characteristics and contextual information.
 
 Understat's existing xG estimates are retained separately for benchmarking and are not used as explanatory variables in the independently developed models.
 
