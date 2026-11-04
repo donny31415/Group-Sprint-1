@@ -159,7 +159,7 @@ The report notebooks should be run in the order listed in Section 3.2, since lat
 
 The cleaned dataset is provided in `data/shots_cleaned.csv`, so the raw data collection process does not need to be repeated to run the modelling analysis. If the data-processing stage is rerun, the resulting dataset should be checked against the version used by the model notebooks to ensure that the observations and feature definitions remain consistent.
 
-The neural network analysis is provided as a rendered HTML file alongside its R Markdown source. The HTML file can be opened directly to inspect the model development and results without installing R.
+The neural network analysis is provided as a rendered HTML file and the R Markdown file can be found in the `dylan/` folder. The HTML file can be opened directly to inspect the model development and results without installing R.
 
 Any manual steps or changes to file paths required to reproduce individual analyses should be followed as documented in the relevant notebook.
 
