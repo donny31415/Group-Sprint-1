@@ -1,4 +1,4 @@
-# Group Sprint 1: Probabilistic Expected Goals ($xG$) Modeling & Spatial Analysis
+# Group Sprint 1: Expected Goals (xG) Modelling & Analysis
 
 ## Project Group & Equity Statement
 
