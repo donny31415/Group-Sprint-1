@@ -40,7 +40,7 @@ All report content is in the `report/` directory and should be read in this orde
 7. `07_comparison_and_analysis.ipynb`
 8. `08_heatmaps.ipynb`
 
-The introduction and data processing should be read first. The four model notebooks (03 to 06) can be read in any order however we have ordered it in terms of simplicity of the models (logistic regression being the simplest). The comparison and analysis notebook brings the models together and includes our conclusions. The heat maps notebook uses the best model (the neural network) to look at where each team over- and underperforms.
+The introduction and data processing should be read first. The four model notebooks (03 to 06) can be read in any order however we have ordered it in terms of simplicity of the models (logistic regression being the simplest). The comparison and analysis notebook brings the models together and includes our conclusions. The heat maps notebook uses the best model (the neural network) to look at where each team over- and underperforms. The html for the Neural Network section is in the report, however if the Markdown file is needed this can be accessed in Dylan's file.
 
 ### Results
 
